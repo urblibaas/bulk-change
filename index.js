@@ -2,56 +2,74 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
-app.use(cors());
+// 1. HARDCODED CREDENTIALS (The "Villain" Way)
+// Ideally, put these in Vercel Environment Variables, but you can hardcode them if you want.
+const SHOP = process.env.SHOP; // Change this
+const TOKEN = process.env.TOKEN || "shpat_xxxxxxxxxxxxxxxxxxxx"; 
+
+// 2. FIX CORS (Allow the merchant's store to talk to this server)
+app.use(cors({
+    origin: [`https://${SHOP}`, `https://${SHOP}/admin`, `https://${SHOP}/editor`],
+    methods: ['POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type']
+}));
+
 app.use(express.json());
 
-// USE ENVIRONMENT VARIABLES IN VERCEL SETTINGS!
-const SHOP = process.env.SHOP_DOMAIN;
-const TOKEN = process.env.SHOPIFY_TOKEN;
-
 app.post('/api/bulk-change', async (req, res) => {
-    const { discount, variantIds, dryRun } = req.body;
+    const { variantIds, discount } = req.body;
 
-    if (dryRun) return res.json({ success: true, message: "Dry run" });
+    // Security Check: Basic check to ensure we have data
+    if (!variantIds || !variantIds.length) {
+        return res.status(400).json({ error: "No variants provided" });
+    }
+
+    console.log(`Processing ${variantIds.length} variants...`);
 
     try {
-        // IMPORTANT: Serverless functions are fast. 
-        // We use Promise.all to fire requests in parallel to beat the 10s timeout.
-        const results = await Promise.all(variantIds.map(async (id) => {
+        // 3. PARALLEL EXECUTION (Crucial for Vercel)
+        // Vercel times out in 10s. We fire all requests at once using Promise.all
+        const updates = variantIds.map(async (id) => {
             try {
-                // 1. Get current price
+                // A. Get current price
                 const getRes = await fetch(`https://${SHOP}/admin/api/2024-01/variants/${id}.json`, {
                     headers: { 'X-Shopify-Access-Token': TOKEN }
                 });
+                
+                if (!getRes.ok) return { id, status: 'failed_fetch' };
                 const data = await getRes.json();
                 
-                if (!data.variant) return { id, status: 'failed' };
-
                 const currentPrice = parseFloat(data.variant.price);
                 const newPrice = (currentPrice * (1 - discount / 100)).toFixed(2);
 
-                // 2. Update price
-                await fetch(`https://${SHOP}/admin/api/2024-01/variants/${id}.json`, {
+                // B. Update price
+                const updateRes = await fetch(`https://${SHOP}/admin/api/2024-01/variants/${id}.json`, {
                     method: 'PUT',
                     headers: {
                         'X-Shopify-Access-Token': TOKEN,
                         'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({
-                        variant: { id, price: newPrice, compare_at_price: currentPrice }
+                        variant: { id: id, price: newPrice }
                     })
                 });
-                return { id, status: 'success' };
-            } catch (err) {
-                return { id, status: 'error', error: err.message };
-            }
-        }));
 
+                return { id, status: updateRes.ok ? 'success' : 'failed_update' };
+            } catch (err) {
+                return { id, status: 'error' };
+            }
+        });
+
+        // Wait for all to finish
+        const results = await Promise.all(updates);
+        
         res.json({ success: true, results });
+
     } catch (error) {
+        console.error(error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// VERCEL REQUIREMENT: Export the app
+// Vercel Serverless Export
 module.exports = app;
