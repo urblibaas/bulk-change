@@ -59,6 +59,7 @@ const JobSchema = new mongoose.Schema({
   variantId: String,
   originalPrice: String, // Stored as string to prevent float math errors
   discountPercent: Number,
+  originalCompareAt: String,
   startTime: Date,
   endTime: Date,
   status: { 
@@ -129,10 +130,9 @@ app.get('/api/cron', async (req, res) => {
   try {
     await connectToDatabase();
 
-    // ------------------------------------------
-    // A. PROCESS STARTING JOBS (Pending -> Active)
-    // ------------------------------------------
-    // Limit 20 to prevent 10s timeout
+    // ==========================================
+    // A. START JOBS (Apply Additive Discount)
+    // ==========================================
     const toStart = await Job.find({ 
       startTime: { $lte: now }, 
       status: 'pending' 
@@ -140,32 +140,59 @@ app.get('/api/cron', async (req, res) => {
 
     for (const job of toStart) {
       try {
-        // 1. Get current price (so we can revert later)
+        // 1. Fetch current data
         const getRes = await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-01/variants/${job.variantId}.json`, {
           headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN }
         });
-        
-        if (!getRes.ok) throw new Error(`Fetch failed for ${job.variantId}`);
         const data = await getRes.json();
         
-        const currentPrice = data.variant.price;
+        // Parse numbers safely
+        const currentPrice = parseFloat(data.variant.price);
+        const rawCompare = data.variant.compare_at_price;
+        const currentCompare = rawCompare ? parseFloat(rawCompare) : 0;
 
-        // 2. Calculate Discount
-        // (price * (1 - 10/100))
-        const newPrice = (parseFloat(currentPrice) * (1 - job.discountPercent / 100)).toFixed(2);
+        // 2. Determine "Anchor" Price (The true Base Price)
+        // If CompareAt exists and is higher than price, use it. Otherwise use Price.
+        const anchorPrice = (currentCompare > currentPrice) ? currentCompare : currentPrice;
 
-        // 3. Update Shopify
+        // 3. Calculate Existing Discount Percentage
+        // Example: Anchor 100, Price 80 = 20% existing gap.
+        let existingDiffPercent = 0;
+        if (anchorPrice > 0 && currentPrice < anchorPrice) {
+            existingDiffPercent = ((anchorPrice - currentPrice) / anchorPrice) * 100;
+        }
+
+        // 4. Add Merchant's Discount
+        // Example: Existing 20% + Merchant 10% = 30% Total
+        const totalDiscountPercent = existingDiffPercent + job.discountPercent;
+
+        // 5. Calculate New Price based on Anchor
+        // Example: 100 * (1 - 0.30) = 70
+        let newPrice = (anchorPrice * (1 - totalDiscountPercent / 100)).toFixed(2);
+        
+        // Safety check: Price cannot be negative
+        if (newPrice < 0) newPrice = "0.00";
+
+        // 6. Update Shopify
+        // We MUST set compare_at_price to the anchor so the discount badge shows correctly
         await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-01/variants/${job.variantId}.json`, {
           method: 'PUT',
           headers: { 
             'X-Shopify-Access-Token': SHOPIFY_TOKEN, 
             'Content-Type': 'application/json' 
           },
-          body: JSON.stringify({ variant: { id: job.variantId, price: newPrice } })
+          body: JSON.stringify({ 
+            variant: { 
+              id: job.variantId, 
+              price: newPrice,
+              compare_at_price: anchorPrice.toFixed(2) // Lock in the Anchor
+            } 
+          })
         });
 
-        // 4. Update Database
-        job.originalPrice = currentPrice;
+        // 7. Save state to DB (So we can revert later)
+        job.originalPrice = currentPrice.toFixed(2);
+        job.originalCompareAt = rawCompare; // Keep null if it was null
         job.status = 'active';
         await job.save();
         
@@ -177,9 +204,9 @@ app.get('/api/cron', async (req, res) => {
       }
     }
 
-    // ------------------------------------------
-    // B. PROCESS REVERTING JOBS (Active -> Completed)
-    // ------------------------------------------
+    // ==========================================
+    // B. REVERT JOBS (Restore Original)
+    // ==========================================
     const toRevert = await Job.find({ 
       endTime: { $lte: now }, 
       status: 'active' 
@@ -187,21 +214,23 @@ app.get('/api/cron', async (req, res) => {
 
     for (const job of toRevert) {
       try {
-        if (!job.originalPrice) {
-          throw new Error(`No original price found for ${job.variantId}`);
-        }
-
-        // 1. Revert Price
+        // We need to restore both Price AND Compare At Price
+        // If originalCompareAt was null, sending null removes it from Shopify
         await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-01/variants/${job.variantId}.json`, {
           method: 'PUT',
           headers: { 
             'X-Shopify-Access-Token': SHOPIFY_TOKEN, 
             'Content-Type': 'application/json' 
           },
-          body: JSON.stringify({ variant: { id: job.variantId, price: job.originalPrice } })
+          body: JSON.stringify({ 
+            variant: { 
+              id: job.variantId, 
+              price: job.originalPrice,
+              compare_at_price: job.originalCompareAt 
+            } 
+          })
         });
 
-        // 2. Mark Completed
         job.status = 'completed';
         await job.save();
 
