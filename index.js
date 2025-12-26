@@ -9,7 +9,7 @@ app.use(express.json());
 const SHOP = process.env.SHOP; // CHANGE THIS
 const TOKEN = process.env.TOKEN; // shpat_...
 const MONGO_URI = process.env.MONGODB_URI; // mongodb+srv://...
-
+const CRON_SECRET = process.env.CRON_SECRET || "my_super_secret_password";
 // 1. CONNECT TO MONGO
 mongoose.connect(MONGO_URI)
   .then(() => console.log("DB Connected"))
@@ -58,6 +58,10 @@ app.post('/api/schedule', async (req, res) => {
 
 // --- ROUTE 2: THE CRON JOB (Runs every minute) ---
 app.get('/api/cron', async (req, res) => {
+    // We check if the URL has ?key=my_super_secret_password
+  if (req.query.key !== CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized. Shoo!" });
+  }
   const now = new Date();
   const log = { started: 0, reverted: 0, errors: [] };
 
