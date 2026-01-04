@@ -330,5 +330,100 @@ app.post('/api/end-all', async (req, res) => {
   }
 });
 
+/**
+ * GET /api/list-jobs
+ * Returns all Pending and Active jobs with Product Details.
+ * Uses Shopify GraphQL to fetch titles/images in one batch request.
+ */
+app.get('/api/list-jobs', async (req, res) => {
+  try {
+    await connectToDatabase();
+
+    // 1. Get jobs from DB (Pending or Active)
+    const jobs = await Job.find({ 
+      status: { $in: ['pending', 'active'] } 
+    }).sort({ startTime: 1 });
+
+    if (!jobs.length) {
+      return res.json({ jobs: [] });
+    }
+
+    // 2. Convert IDs to Shopify GraphQL format (Global IDs)
+    // format: "gid://shopify/ProductVariant/123456789"
+    const variantGids = jobs.map(j => `gid://shopify/ProductVariant/${j.variantId}`);
+
+    // 3. Query Shopify GraphQL (Fetch all details in ONE call)
+    const query = `
+      query($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on ProductVariant {
+            id
+            title
+            price
+            product {
+              title
+              handle
+              featuredImage {
+                url(transform: {maxWidth: 100})
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const shopifyRes = await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-01/graphql.json`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': SHOPIFY_TOKEN
+      },
+      body: JSON.stringify({
+        query: query,
+        variables: { ids: variantGids }
+      })
+    });
+
+    const shopifyData = await shopifyRes.json();
+    
+    // 4. Create a lookup map for fast merging
+    // Map Key: "123456789" (Numeric ID extracted from GID)
+    const shopifyMap = {};
+    if (shopifyData.data && shopifyData.data.nodes) {
+      shopifyData.data.nodes.forEach(node => {
+        if (node) {
+          const numericId = node.id.split('/').pop();
+          shopifyMap[numericId] = node;
+        }
+      });
+    }
+
+    // 5. Merge DB data with Shopify Data
+    const results = jobs.map(job => {
+      const details = shopifyMap[job.variantId];
+      return {
+        id: job._id,
+        variantId: job.variantId,
+        status: job.status,
+        discount: job.discountPercent,
+        startTime: job.startTime,
+        endTime: job.endTime,
+        // Product Details (or fallbacks if product was deleted)
+        productTitle: details?.product?.title || "Unknown Product",
+        variantTitle: details?.title || "",
+        handle: details?.product?.handle || null,
+        image: details?.product?.featuredImage?.url || null,
+        currentPrice: details?.price || "N/A"
+      };
+    });
+
+    res.json({ jobs: results });
+
+  } catch (error) {
+    console.error("List Jobs Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Required for Vercel
 module.exports = app;
