@@ -7,8 +7,6 @@ const app = express();
 // ---------------------------------------------
 // 1. CONFIGURATION
 // ---------------------------------------------
-// Ideally, set these in Vercel Environment Variables.
-// If you are lazy, you can hardcode strings here (but be careful!).
 const SHOP_DOMAIN = process.env.SHOP || "your-store.myshopify.com"; 
 const SHOPIFY_TOKEN = process.env.TOKEN; // shpat_...
 const MONGO_URI = process.env.MONGODB_URI; 
@@ -246,6 +244,88 @@ app.get('/api/cron', async (req, res) => {
 
   } catch (error) {
     console.error("Cron Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * POST /api/end-all
+ * EMERGENCY ENDPOINT: 
+ * 1. Cancels all "pending" jobs (preventing them from starting).
+ * 2. Immediately reverts all "active" jobs (restoring original prices).
+ * usage: POST https://your-app.vercel.app/api/end-all?key=my_super_secret_password
+ */
+app.post('/api/end-all', async (req, res) => {
+  // 1. Security Check (Matches your CRON_SECRET)
+  if (req.query.key !== CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    await connectToDatabase();
+
+    // ---------------------------------------------------
+    // A. CANCEL FUTURE JOBS (Status: pending)
+    // ---------------------------------------------------
+    // We update them to 'completed' so the Cron ignores them forever.
+    const cancelResult = await Job.updateMany(
+      { status: 'pending' }, 
+      { status: 'completed' }
+    );
+
+    // ---------------------------------------------------
+    // B. REVERT LIVE DISCOUNTS (Status: active)
+    // ---------------------------------------------------
+    // Find all jobs that are currently modifying Shopify prices
+    const activeJobs = await Job.find({ status: 'active' });
+    
+    const log = { 
+      cancelled_future_jobs: cancelResult.modifiedCount, 
+      reverted_active_jobs: 0, 
+      errors: [] 
+    };
+
+    // Loop through active jobs and restore prices immediately
+    for (const job of activeJobs) {
+      try {
+        // Restore Shopify Price using stored original data
+        const response = await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-01/variants/${job.variantId}.json`, {
+          method: 'PUT',
+          headers: { 
+            'X-Shopify-Access-Token': SHOPIFY_TOKEN, 
+            'Content-Type': 'application/json' 
+          },
+          body: JSON.stringify({ 
+            variant: { 
+              id: job.variantId, 
+              price: job.originalPrice, 
+              compare_at_price: job.originalCompareAt 
+            } 
+          })
+        });
+
+        if (!response.ok) {
+           throw new Error(`Shopify API responded with ${response.status}`);
+        }
+
+        // Mark as completed in DB
+        job.status = 'completed';
+        // Optional: set endTime to now so we know when it was forced closed
+        job.endTime = new Date(); 
+        await job.save();
+
+        log.reverted_active_jobs++;
+
+      } catch (err) {
+        console.error(`Force Revert Error [${job.variantId}]:`, err.message);
+        log.errors.push({ variantId: job.variantId, error: err.message });
+      }
+    }
+
+    res.json({ success: true, message: "Bulk termination processed.", details: log });
+
+  } catch (error) {
+    console.error("End-All API Error:", error);
     res.status(500).json({ error: error.message });
   }
 });
